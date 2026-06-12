@@ -2,8 +2,16 @@
  * Core health/discovery/launch logic.
  */
 import { getClient, getTargetInfo, evaluate } from '../connection.js';
-import { existsSync } from 'fs';
-import { execSync, spawn } from 'child_process';
+import { existsSync as _existsSync, readdirSync as _readdirSync } from 'fs';
+import { execSync as _execSync, spawn } from 'child_process';
+
+function _resolve(deps) {
+  return {
+    existsSync: deps?.existsSync || _existsSync,
+    readdirSync: deps?.readdirSync || _readdirSync,
+    execSync: deps?.execSync || _execSync,
+  };
+}
 
 export async function healthCheck() {
   await getClient();
@@ -159,25 +167,63 @@ export async function uiState() {
   return { success: true, ...state };
 }
 
-export async function launch({ port, kill_existing } = {}) {
-  const cdpPort = port || 9222;
-  const killFirst = kill_existing !== false;
-  const platform = process.platform;
+const WINDOWS_APPS_DIR = 'C:\\Program Files\\WindowsApps';
+
+/**
+ * Find TradingView.exe of a Microsoft Store (MSIX) install.
+ * Get-AppxPackage is the reliable route — the WindowsApps directory is
+ * ACL-restricted on most machines, so the directory glob is only a fallback.
+ * Launching the packaged exe directly with --remote-debugging-port works.
+ */
+function findMsixTradingView({ existsSync, readdirSync, execSync }) {
+  try {
+    const loc = execSync(
+      'powershell -NoProfile -NonInteractive -Command "(Get-AppxPackage -Name TradingView.Desktop).InstallLocation"',
+      { timeout: 10000 }
+    ).toString().trim();
+    if (loc) {
+      const exe = `${loc}\\TradingView.exe`;
+      if (existsSync(exe)) return exe;
+    }
+  } catch { /* PowerShell unavailable or package not installed */ }
+
+  try {
+    const pkgs = readdirSync(WINDOWS_APPS_DIR)
+      .filter((name) => /^TradingView\.Desktop_[\d.]+_x64__/.test(name))
+      .sort((a, b) => {
+        const va = a.split('_')[1].split('.').map(Number);
+        const vb = b.split('_')[1].split('.').map(Number);
+        for (let i = 0; i < Math.max(va.length, vb.length); i++) {
+          if ((va[i] || 0) !== (vb[i] || 0)) return (vb[i] || 0) - (va[i] || 0);
+        }
+        return 0;
+      });
+    for (const pkg of pkgs) {
+      const exe = `${WINDOWS_APPS_DIR}\\${pkg}\\TradingView.exe`;
+      if (existsSync(exe)) return exe;
+    }
+  } catch { /* directory unreadable (ACL) or missing */ }
+
+  return null;
+}
+
+export function findTradingViewPath({ platform = process.platform, env = process.env, _deps } = {}) {
+  const { existsSync, readdirSync, execSync } = _resolve(_deps);
 
   const pathMap = {
     darwin: [
       '/Applications/TradingView.app/Contents/MacOS/TradingView',
-      `${process.env.HOME}/Applications/TradingView.app/Contents/MacOS/TradingView`,
+      `${env.HOME}/Applications/TradingView.app/Contents/MacOS/TradingView`,
     ],
     win32: [
-      `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`,
-      `${process.env.PROGRAMFILES}\\TradingView\\TradingView.exe`,
-      `${process.env['PROGRAMFILES(X86)']}\\TradingView\\TradingView.exe`,
+      `${env.LOCALAPPDATA}\\TradingView\\TradingView.exe`,
+      `${env.PROGRAMFILES}\\TradingView\\TradingView.exe`,
+      `${env['PROGRAMFILES(X86)']}\\TradingView\\TradingView.exe`,
     ],
     linux: [
       '/opt/TradingView/tradingview',
       '/opt/TradingView/TradingView',
-      `${process.env.HOME}/.local/share/TradingView/TradingView`,
+      `${env.HOME}/.local/share/TradingView/TradingView`,
       '/usr/bin/tradingview',
       '/snap/tradingview/current/tradingview',
     ],
@@ -187,6 +233,11 @@ export async function launch({ port, kill_existing } = {}) {
   const candidates = pathMap[platform] || pathMap.linux;
   for (const p of candidates) {
     if (p && existsSync(p)) { tvPath = p; break; }
+  }
+
+  if (!tvPath && platform === 'win32') {
+    tvPath = findMsixTradingView({ existsSync, readdirSync, execSync });
+    candidates.push(`${WINDOWS_APPS_DIR}\\TradingView.Desktop_*_x64__*\\TradingView.exe (Microsoft Store)`);
   }
 
   if (!tvPath) {
@@ -206,6 +257,17 @@ export async function launch({ port, kill_existing } = {}) {
       }
     } catch { /* ignore */ }
   }
+
+  return { tvPath, candidates };
+}
+
+export async function launch({ port, kill_existing, _deps } = {}) {
+  const cdpPort = port || 9222;
+  const killFirst = kill_existing !== false;
+  const platform = process.platform;
+  const { execSync } = _resolve(_deps);
+
+  const { tvPath, candidates } = findTradingViewPath({ platform, _deps });
 
   if (!tvPath) {
     throw new Error(`TradingView not found on ${platform}. Searched: ${candidates.join(', ')}. Launch manually with: /path/to/TradingView --remote-debugging-port=${cdpPort}`);
