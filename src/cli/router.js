@@ -3,6 +3,7 @@
  * Zero dependencies — uses only Node.js built-ins.
  */
 import { parseArgs } from 'node:util';
+import { disconnect } from '../connection.js';
 
 /** @type {Map<string, { description: string, options?: object, handler: Function, subcommands?: Map<string, object> }>} */
 const commands = new Map();
@@ -50,12 +51,22 @@ function printCommandHelp(name, cmd) {
   }
 }
 
+// process.exit() can abort with STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on
+// Windows when libuv handles are still closing — e.g. undici internals right
+// after a fetch(). Set exitCode and let the event loop drain instead; the
+// unref'd fallback timer only fires if a leaked handle keeps the loop alive.
+function finish(code) {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 2000).unref();
+}
+
 export async function run(argv) {
   const args = argv.slice(2);
 
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     printHelp();
-    process.exit(0);
+    finish(0);
+    return;
   }
 
   const cmdName = args[0];
@@ -64,7 +75,8 @@ export async function run(argv) {
   if (!cmd) {
     console.error(`Unknown command: ${cmdName}`);
     console.error('Run "tv --help" for a list of commands.');
-    process.exit(1);
+    finish(1);
+    return;
   }
 
   // Handle subcommands (e.g., tv pine get)
@@ -73,13 +85,15 @@ export async function run(argv) {
     const subName = args[1];
     if (!subName || subName === '--help' || subName === '-h') {
       printCommandHelp(cmdName, cmd);
-      process.exit(0);
+      finish(0);
+      return;
     }
     const sub = cmd.subcommands.get(subName);
     if (!sub) {
       console.error(`Unknown subcommand: ${cmdName} ${subName}`);
       printCommandHelp(cmdName, cmd);
-      process.exit(1);
+      finish(1);
+      return;
     }
     handler = sub.handler;
     options = sub.options || {};
@@ -101,11 +115,12 @@ export async function run(argv) {
             console.log(`  ${flag.padEnd(20)}${v.description || ''}`);
           }
         }
-        process.exit(0);
+        finish(0);
+        return;
       }
       await execute(handler, values, positionals);
     } catch (err) {
-      handleError(err);
+      await handleError(err);
     }
   } else {
     handler = cmd.handler;
@@ -119,11 +134,12 @@ export async function run(argv) {
       });
       if (values.help) {
         printCommandHelp(cmdName, cmd);
-        process.exit(0);
+        finish(0);
+        return;
       }
       await execute(handler, values, positionals);
     } catch (err) {
-      handleError(err);
+      await handleError(err);
     }
   }
 }
@@ -132,19 +148,17 @@ async function execute(handler, values, positionals) {
   try {
     const result = await handler(values, positionals);
     console.log(JSON.stringify(result, null, 2));
-    process.exit(0);
+    try { await disconnect(); } catch {}
+    finish(0);
   } catch (err) {
-    handleError(err);
+    await handleError(err);
   }
 }
 
-function handleError(err) {
+async function handleError(err) {
   const message = err.message || String(err);
-  // Connection failures get exit code 2
-  if (/CDP|connection|ECONNREFUSED|not running/i.test(message)) {
-    console.error(JSON.stringify({ success: false, error: message }, null, 2));
-    process.exit(2);
-  }
   console.error(JSON.stringify({ success: false, error: message }, null, 2));
-  process.exit(1);
+  try { await disconnect(); } catch {}
+  // Connection failures get exit code 2
+  finish(/CDP|connection|ECONNREFUSED|not running/i.test(message) ? 2 : 1);
 }
