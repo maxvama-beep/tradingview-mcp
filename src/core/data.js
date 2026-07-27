@@ -242,12 +242,23 @@ export async function getEquity() {
   return { success: true, data_points: equity?.data?.length || 0, source: equity?.source, data: equity?.data || [], equity_summary: equity?.equity_summary, note: equity?.note, error: equity?.error };
 }
 
-export async function getQuote({ symbol } = {}) {
-  const data = await evaluate(`
+/**
+ * Normalize a symbol for comparison: uppercase, drop any exchange prefix.
+ * "NSE:BHEL", "nse:bhel" and "bhel" all normalize to "BHEL".
+ */
+function normalizeSymbol(sym) {
+  const s = String(sym || '').trim().toUpperCase();
+  const colon = s.lastIndexOf(':');
+  return colon === -1 ? s : s.slice(colon + 1);
+}
+
+export async function getQuote({ symbol, _deps } = {}) {
+  const _evaluate = _deps?.evaluate || evaluate;
+  const data = await _evaluate(`
     (function() {
       var api = ${CHART_API};
-      var sym = ${safeString(symbol || '')};
-      if (!sym) { try { sym = api.symbol(); } catch(e) {} }
+      var sym = '';
+      try { sym = api.symbol(); } catch(e) {}
       if (!sym) { try { sym = api.symbolExt().symbol; } catch(e) {} }
       var ext = {};
       try { ext = api.symbolExt() || {}; } catch(e) {}
@@ -274,6 +285,15 @@ export async function getQuote({ symbol } = {}) {
     })()
   `);
   if (!data || (!data.last && !data.close)) throw new Error('Could not retrieve quote. The chart may still be loading.');
+  // quote_get reads the active chart's series — it cannot fetch an arbitrary symbol.
+  // A mismatched `symbol` must fail loudly, or the caller gets chart data mislabelled
+  // as the symbol they asked for.
+  if (symbol && normalizeSymbol(symbol) !== normalizeSymbol(data.symbol)) {
+    throw new Error(
+      `quote_get reads the active chart, which is currently ${data.symbol}, not ${symbol}. ` +
+      `It cannot quote a symbol that is not on the chart — call chart_set_symbol first, then quote_get.`
+    );
+  }
   return { success: true, ...data };
 }
 
