@@ -51,6 +51,16 @@ const BARS_PATH = `${CHART_API}._chartWidget.model().mainSeries().bars()`;
 const BOTTOM_BAR = 'window.TradingView.bottomWidgetBar';
 const REPLAY_API = 'window.TradingViewApi._replayApi';
 
+/** Close a bottom-bar widget. TV Desktop 3.3 removed hideWidget(); close() minimizes the bar instead. */
+function closeBottomWidget(name) {
+  return `(function() {
+    var bwb = ${BOTTOM_BAR};
+    if (!bwb) return;
+    if (typeof bwb.hideWidget === 'function') bwb.hideWidget('${name}');
+    else if (typeof bwb.close === 'function') bwb.close();
+  })()`;
+}
+
 /** Unwrap TradingView WatchedValue objects */
 function wv(path) {
   return `(function(){ var v = ${path}; return (v && typeof v === 'object' && typeof v.value === 'function') ? v.value() : v; })()`;
@@ -626,7 +636,7 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
       assert.ok(typeof data.panel_found === 'boolean', 'Strategy panel detection works');
 
       // Close it
-      await evaluate(`try { ${BOTTOM_BAR}.hideWidget('backtesting'); } catch(e) {}`);
+      await evaluate(closeBottomWidget('backtesting'));
     });
 
     it('data_get_trades — trade list (panel-dependent)', async () => {
@@ -637,7 +647,7 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
         !!(document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'))
       `);
       assert.ok(typeof panelExists === 'boolean', 'Panel detection works');
-      await evaluate(`try { ${BOTTOM_BAR}.hideWidget('backtesting'); } catch(e) {}`);
+      await evaluate(closeBottomWidget('backtesting'));
     });
 
     it('data_get_equity — equity curve (panel-dependent)', async () => {
@@ -648,7 +658,7 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
         !!(document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'))
       `);
       assert.ok(typeof panelExists === 'boolean', 'Panel detection works');
-      await evaluate(`try { ${BOTTOM_BAR}.hideWidget('backtesting'); } catch(e) {}`);
+      await evaluate(closeBottomWidget('backtesting'));
     });
   });
 
@@ -665,7 +675,7 @@ describe('TradingView MCP — Full E2E (70 tools)', () => {
     after(async () => {
       // Restore editor state
       if (!editorWasOpen) {
-        await evaluate(`try { ${BOTTOM_BAR}.hideWidget('pine-editor'); } catch(e) {}`);
+        await evaluate(closeBottomWidget('pine-editor'));
         await sleep(300);
       }
     });
@@ -1031,13 +1041,19 @@ val = array.get(a, 5)`;
       const bwb = await apiExists(BOTTOM_BAR);
       assert.ok(bwb, 'bottomWidgetBar exists');
 
-      // Open
-      await evaluate(`${BOTTOM_BAR}.showWidget('pine-editor')`);
+      // Open — widget renamed 'pine-editor' → 'scripteditor' in TV Desktop 3.3; unknown names are a no-op
+      await evaluate(`
+        (function() {
+          var bwb = ${BOTTOM_BAR};
+          if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab();
+          else { bwb.showWidget('scripteditor'); bwb.showWidget('pine-editor'); }
+        })()
+      `);
       await sleep(500);
       const isOpen = await evaluate(`!!document.querySelector('.monaco-editor.pine-editor-monaco')`);
 
       // Close
-      await evaluate(`${BOTTOM_BAR}.hideWidget('pine-editor')`);
+      await evaluate(closeBottomWidget('pine-editor'));
       await sleep(300);
 
       assert.ok(typeof isOpen === 'boolean', 'Panel toggle works');
