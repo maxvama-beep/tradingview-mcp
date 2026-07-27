@@ -1,11 +1,20 @@
 /**
  * Core health/discovery/launch logic.
  */
-import { getClient, getTargetInfo, evaluate } from '../connection.js';
-import { existsSync } from 'fs';
-import { execSync, spawn } from 'child_process';
+import { getClient as _getClient, getTargetInfo as _getTargetInfo, evaluate as _evaluate } from '../connection.js';
+import { existsSync as _existsSync } from 'fs';
+import { execSync as _execSync, spawn as _spawn } from 'child_process';
 
-export async function healthCheck() {
+function _resolve(deps) {
+  return {
+    getClient: deps?.getClient || _getClient,
+    getTargetInfo: deps?.getTargetInfo || _getTargetInfo,
+    evaluate: deps?.evaluate || _evaluate,
+  };
+}
+
+export async function healthCheck({ _deps } = {}) {
+  const { getClient, getTargetInfo, evaluate } = _resolve(_deps);
   await getClient();
   const target = await getTargetInfo();
 
@@ -18,6 +27,7 @@ export async function healthCheck() {
         result.resolution = chart.resolution();
         result.chartType = chart.chartType();
         result.apiAvailable = true;
+        try { result.studyCount = chart.getAllStudies().length; } catch(e2) {}
       } catch(e) {
         result.symbol = 'unknown';
         result.resolution = 'unknown';
@@ -39,10 +49,13 @@ export async function healthCheck() {
     chart_resolution: state?.resolution || 'unknown',
     chart_type: state?.chartType ?? null,
     api_available: state?.apiAvailable ?? false,
+    ...(typeof state?.studyCount === 'number' ? { study_count: state.studyCount } : {}),
+    ...(state?.apiError ? { api_error: state.apiError, hint: 'CDP is connected but the chart API is not ready. The chart may still be loading — retry in a few seconds.' } : {}),
   };
 }
 
-export async function discover() {
+export async function discover({ _deps } = {}) {
+  const { evaluate } = _resolve(_deps);
   const paths = await evaluate(`
     (function() {
       var results = {};
@@ -88,7 +101,8 @@ export async function discover() {
   return { success: true, apis_available: available, apis_total: total, apis: paths };
 }
 
-export async function uiState() {
+export async function uiState({ _deps } = {}) {
+  const { evaluate } = _resolve(_deps);
   const state = await evaluate(`
     (function() {
       var ui = {};
@@ -159,25 +173,48 @@ export async function uiState() {
   return { success: true, ...state };
 }
 
-export async function launch({ port, kill_existing } = {}) {
+async function _checkCdp(port) {
+  const http = await import('http');
+  return new Promise((resolve) => {
+    http.get(`http://localhost:${port}/json/version`, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => resolve(data));
+    }).on('error', () => resolve(null));
+  });
+}
+
+function _resolveLaunch(deps) {
+  return {
+    existsSync: deps?.existsSync || _existsSync,
+    execSync: deps?.execSync || _execSync,
+    spawn: deps?.spawn || _spawn,
+    checkCdp: deps?.checkCdp || _checkCdp,
+    sleep: deps?.sleep || ((ms) => new Promise(r => setTimeout(r, ms))),
+    platform: deps?.platform || process.platform,
+    env: deps?.env || process.env,
+  };
+}
+
+export async function launch({ port, kill_existing, _deps } = {}) {
+  const { existsSync, execSync, spawn, checkCdp, sleep, platform, env } = _resolveLaunch(_deps);
   const cdpPort = port || 9222;
   const killFirst = kill_existing !== false;
-  const platform = process.platform;
 
   const pathMap = {
     darwin: [
       '/Applications/TradingView.app/Contents/MacOS/TradingView',
-      `${process.env.HOME}/Applications/TradingView.app/Contents/MacOS/TradingView`,
+      `${env.HOME}/Applications/TradingView.app/Contents/MacOS/TradingView`,
     ],
     win32: [
-      `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`,
-      `${process.env.PROGRAMFILES}\\TradingView\\TradingView.exe`,
-      `${process.env['PROGRAMFILES(X86)']}\\TradingView\\TradingView.exe`,
+      `${env.LOCALAPPDATA}\\TradingView\\TradingView.exe`,
+      `${env.PROGRAMFILES}\\TradingView\\TradingView.exe`,
+      `${env['PROGRAMFILES(X86)']}\\TradingView\\TradingView.exe`,
     ],
     linux: [
       '/opt/TradingView/tradingview',
       '/opt/TradingView/TradingView',
-      `${process.env.HOME}/.local/share/TradingView/TradingView`,
+      `${env.HOME}/.local/share/TradingView/TradingView`,
       '/usr/bin/tradingview',
       '/snap/tradingview/current/tradingview',
     ],
@@ -215,7 +252,7 @@ export async function launch({ port, kill_existing } = {}) {
     try {
       if (platform === 'win32') execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
       else execSync('pkill -f TradingView', { timeout: 5000 });
-      await new Promise(r => setTimeout(r, 1500));
+      await sleep(1500);
     } catch { /* may not be running */ }
   }
 
@@ -223,16 +260,9 @@ export async function launch({ port, kill_existing } = {}) {
   child.unref();
 
   for (let i = 0; i < 15; i++) {
-    await new Promise(r => setTimeout(r, 1000));
+    await sleep(1000);
     try {
-      const http = await import('http');
-      const ready = await new Promise((resolve) => {
-        http.get(`http://localhost:${cdpPort}/json/version`, (res) => {
-          let data = '';
-          res.on('data', (chunk) => data += chunk);
-          res.on('end', () => resolve(data));
-        }).on('error', () => resolve(null));
-      });
+      const ready = await checkCdp(cdpPort);
       if (ready) {
         const info = JSON.parse(ready);
         return {
