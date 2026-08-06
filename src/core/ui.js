@@ -28,35 +28,113 @@ export async function click({ by, value }) {
   return { success: true, clicked: result };
 }
 
+/**
+ * Report whether a bottom panel is open, and which mechanism this build uses.
+ *
+ * TradingView Desktop 3.3 moved the Pine editor out of the bottom widget bar
+ * and into a side dialog. `bottomWidgetBar` still exists on 3.3, but it
+ * registers no widgets — enabledWidgets() is empty — so showWidget(),
+ * activateScriptEditorTab() and hideWidget() all return without doing
+ * anything. Detect the dialog and drive it directly instead.
+ */
+async function readPanelState(panel) {
+  return evaluate(`
+    (function() {
+      var panel = ${JSON.stringify(panel)};
+      if (panel === 'pine-editor' && document.querySelector('[data-name="pine-dialog-button"]')) {
+        // The dialog is removed from the DOM when closed, so presence is the
+        // test. Do not use offsetParent: the dialog is position:fixed, which
+        // makes offsetParent null even while it is plainly visible.
+        return { mode: 'dialog', is_open: !!document.querySelector('[data-name="pine-dialog"]') };
+      }
+      var bottomArea = document.querySelector('[class*="layout__area--bottom"]');
+      var isOpen = !!(bottomArea && bottomArea.offsetHeight > 50);
+      if (panel === 'pine-editor') { isOpen = isOpen && !!document.querySelector('.monaco-editor.pine-editor-monaco'); }
+      if (panel === 'strategy-tester') { var s = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'); isOpen = isOpen && !!(s && s.offsetParent); }
+      return { mode: 'widget-bar', is_open: isOpen };
+    })()
+  `);
+}
+
+async function performPanelAction(panel, mode, open) {
+  if (mode === 'dialog') {
+    return evaluate(`
+      (function() {
+        var wantOpen = ${JSON.stringify(!!open)};
+        var dialog = document.querySelector('[data-name="pine-dialog"]');
+        if (wantOpen) {
+          if (dialog) return { acted: false, reason: 'already open' };
+          var btn = document.querySelector('[data-name="pine-dialog-button"]');
+          if (!btn) return { acted: false, reason: 'pine dialog button not found' };
+          btn.click();
+          return { acted: true };
+        }
+        if (!dialog) return { acted: false, reason: 'already closed' };
+        // The toolbar button opens but does not toggle shut; the dialog has its
+        // own Close control.
+        var btns = dialog.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+          if (btns[i].getAttribute('aria-label') === 'Close') { btns[i].click(); return { acted: true }; }
+        }
+        return { acted: false, reason: 'no Close control inside pine dialog' };
+      })()
+    `);
+  }
+  return evaluate(`
+    (function() {
+      var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+      if (!bwb) return { acted: false, reason: 'bottomWidgetBar not available' };
+      var wantOpen = ${JSON.stringify(!!open)};
+      var widgetName = ${JSON.stringify(panel === 'pine-editor' ? 'pine-editor' : 'backtesting')};
+      var isPine = ${JSON.stringify(panel === 'pine-editor')};
+      if (wantOpen) {
+        if (isPine && typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab();
+        else if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName);
+        else return { acted: false, reason: 'bottomWidgetBar exposes no show method' };
+        return { acted: true };
+      }
+      if (typeof bwb.hideWidget === 'function') { bwb.hideWidget(widgetName); return { acted: true }; }
+      if (typeof bwb.close === 'function') { bwb.close(); return { acted: true }; }
+      return { acted: false, reason: 'bottomWidgetBar exposes no hide method' };
+    })()
+  `);
+}
+
 export async function openPanel({ panel, action }) {
   const isBottomPanel = panel === 'pine-editor' || panel === 'strategy-tester';
   if (isBottomPanel) {
-    const widgetName = panel === 'pine-editor' ? 'pine-editor' : 'backtesting';
-    const result = await evaluate(`
-      (function() {
-        var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
-        if (!bwb) return { error: 'bottomWidgetBar not available' };
-        var panel = ${JSON.stringify(panel)};
-        var widgetName = ${JSON.stringify(widgetName)};
-        var action = ${JSON.stringify(action)};
-        var bottomArea = document.querySelector('[class*="layout__area--bottom"]');
-        var isOpen = !!(bottomArea && bottomArea.offsetHeight > 50);
-        if (panel === 'pine-editor') { var monacoEl = document.querySelector('.monaco-editor.pine-editor-monaco'); isOpen = isOpen && !!monacoEl; }
-        if (panel === 'strategy-tester') { var stratPanel = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'); isOpen = isOpen && !!(stratPanel && stratPanel.offsetParent); }
-        var performed = 'none';
-        if (action === 'open' || (action === 'toggle' && !isOpen)) {
-          if (panel === 'pine-editor') { if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab(); else if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
-          else { if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
-          performed = 'opened';
-        } else if (action === 'close' || (action === 'toggle' && isOpen)) {
-          if (typeof bwb.hideWidget === 'function') bwb.hideWidget(widgetName);
-          performed = 'closed';
-        }
-        return { was_open: isOpen, performed: performed };
-      })()
-    `);
-    if (result && result.error) throw new Error(result.error);
-    return { success: true, panel, action, was_open: result?.was_open ?? false, performed: result?.performed ?? 'unknown' };
+    const before = await readPanelState(panel);
+    const wasOpen = !!(before && before.is_open);
+    const mode = (before && before.mode) || 'widget-bar';
+    const wantOpen = action === 'open' || (action === 'toggle' && !wasOpen);
+    const wantClose = action === 'close' || (action === 'toggle' && wasOpen);
+
+    if (!wantOpen && !wantClose) {
+      return { success: true, panel, action, mode, was_open: wasOpen, performed: 'none' };
+    }
+
+    const outcome = await performPanelAction(panel, mode, wantOpen);
+
+    // Confirm the panel actually moved. The previous implementation reported
+    // 'opened'/'closed' without checking, so on builds where the underlying
+    // call is a no-op it claimed success while nothing happened.
+    let isOpen = wasOpen;
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, 200));
+      const state = await readPanelState(panel);
+      isOpen = !!(state && state.is_open);
+      if (isOpen === wantOpen) break;
+    }
+
+    if (isOpen !== wantOpen) {
+      const why = outcome && outcome.reason ? ` (${outcome.reason})` : '';
+      throw new Error(
+        `Could not ${wantOpen ? 'open' : 'close'} ${panel} on this TradingView build${why}. ` +
+        `Detected mechanism: ${mode}. The panel state did not change.`
+      );
+    }
+
+    return { success: true, panel, action, mode, was_open: wasOpen, performed: wantOpen ? 'opened' : 'closed', verified: true };
   } else {
     const selectorMap = {
       'watchlist': { dataName: 'base-watchlist-widget-button', ariaLabel: 'Watchlist' },
