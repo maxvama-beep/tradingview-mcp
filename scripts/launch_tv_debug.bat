@@ -6,8 +6,11 @@ set PORT=%1
 if "%PORT%"=="" set PORT=9222
 
 REM Kill existing TradingView instances
+REM Sleeps use ping, not timeout: "timeout" aborts with "Input redirection is
+REM not supported" whenever stdin is redirected, which is how this script runs
+REM when spawned by tv_launch rather than typed into a console.
 taskkill /F /IM TradingView.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
+ping -n 3 127.0.0.1 >nul
 
 REM Auto-detect TradingView install location
 set "TV_EXE="
@@ -39,17 +42,40 @@ echo Starting with --remote-debugging-port=%PORT%...
 start "" "%TV_EXE%" --remote-debugging-port=%PORT%
 
 echo Waiting for CDP to become available...
-timeout /t 5 /nobreak >nul
+ping -n 6 127.0.0.1 >nul
+
+REM Poll for at most MAX_TRIES attempts, 2 seconds apart, then give up
+set /a TRIES=0
+set /a MAX_TRIES=30
 
 :check
 curl -s http://localhost:%PORT%/json/version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Still waiting...
-    timeout /t 2 /nobreak >nul
-    goto check
-)
+if %errorlevel% equ 0 goto ready
+set /a TRIES+=1
+if %TRIES% geq %MAX_TRIES% goto giveup
+echo Still waiting... (%TRIES%/%MAX_TRIES%)
+ping -n 3 127.0.0.1 >nul
+goto check
 
+:giveup
+echo.
+echo Error: CDP never came up on port %PORT% after %MAX_TRIES% attempts.
+echo.
+echo Things to check:
+echo   - Is TradingView actually running? It may have failed to start.
+echo   - Is another process already using port %PORT%? Try a different port:
+echo       scripts\launch_tv_debug.bat 9333
+echo   - Microsoft Store (MSIX) installs accept --remote-debugging-port fine,
+echo     but the WindowsApps probe above cannot see them: that directory is
+echo     ACL-restricted, so "dir /s /b" returns nothing. Get the real path with
+echo       powershell -c "(Get-AppxPackage *TradingView*).InstallLocation"
+echo     and launch that exe directly.
+echo   - Launched exe was: %TV_EXE%
+exit /b 1
+
+:ready
 echo.
 echo CDP ready at http://localhost:%PORT%
 curl -s http://localhost:%PORT%/json/version
 echo.
+exit /b 0
