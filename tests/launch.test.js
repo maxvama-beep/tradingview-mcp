@@ -1,131 +1,150 @@
 /**
- * Tests for TradingView path resolution in src/core/health.js.
- * Covers: standard install paths, Microsoft Store (MSIX) detection via
- * Get-AppxPackage and WindowsApps directory glob, and the not-found case.
+ * Tests for launch() in src/core/health.js.
+ * Covers Windows MSIX handling: direct WindowsApps spawn, local-copy fallback
+ * when spawn fails or CDP never binds, copy reuse, and classic-path launches.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { findTradingViewPath } from '../src/core/health.js';
+import { EventEmitter } from 'node:events';
+import { launch } from '../src/core/health.js';
 
-const WIN_ENV = {
-  LOCALAPPDATA: 'C:\\Users\\test\\AppData\\Local',
-  PROGRAMFILES: 'C:\\Program Files',
-  'PROGRAMFILES(X86)': 'C:\\Program Files (x86)',
-};
+const MSIX_EXE = 'C:\\Program Files\\WindowsApps\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\\TradingView.exe';
+const LOCAL_COPY_EXE = `${process.env.LOCALAPPDATA || ''}\\tradingview-mcp\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\\TradingView.exe`;
+const CDP_VERSION = JSON.stringify({ Browser: 'Chrome/140', 'User-Agent': 'TVDesktop/3.1.0' });
 
-const MSIX_PKG = 'TradingView.Desktop_3.2.0.7916_x64__n534cwy3pjxzj';
-const MSIX_EXE = `C:\\Program Files\\WindowsApps\\${MSIX_PKG}\\TradingView.exe`;
+// ── Mock helpers ─────────────────────────────────────────────────────────
 
-/** Build _deps where existsSync is true only for the given paths. */
-function mockDeps({ existing = [], execResults = {}, dirEntries = null } = {}) {
-  const execCalls = [];
-  const deps = {
-    existsSync: (p) => existing.includes(p),
-    execSync: (cmd) => {
-      execCalls.push(cmd);
-      for (const [key, val] of Object.entries(execResults)) {
-        if (cmd.includes(key)) {
-          if (val instanceof Error) throw val;
-          return val;
-        }
-      }
-      throw new Error(`command failed: ${cmd}`);
-    },
-    readdirSync: () => {
-      if (dirEntries === null) throw new Error('EPERM: operation not permitted');
-      return dirEntries;
-    },
-  };
-  return { _deps: deps, execCalls };
+function mockChild({ failWith } = {}) {
+  const child = new EventEmitter();
+  child.pid = 12345;
+  child.unref = () => {};
+  if (failWith) queueMicrotask(() => child.emit('error', Object.assign(new Error(failWith), { code: failWith })));
+  return child;
 }
 
-describe('findTradingViewPath — win32 standard installs', () => {
-  it('finds the %LOCALAPPDATA% install without invoking PowerShell', () => {
-    const exe = `${WIN_ENV.LOCALAPPDATA}\\TradingView\\TradingView.exe`;
-    const { _deps, execCalls } = mockDeps({ existing: [exe] });
-    const { tvPath } = findTradingViewPath({ platform: 'win32', env: WIN_ENV, _deps });
-    assert.equal(tvPath, exe);
-    assert.equal(execCalls.length, 0, 'no shell commands when a static path matches');
+/**
+ * Build a _deps bundle simulating a win32 MSIX environment.
+ * @param {object} opts
+ *   spawnFailures — spawn paths (substring) that emit EACCES
+ *   cdpBindsFor  — spawn paths (substring) after which probeCdp starts succeeding
+ *   copyExists   — local copy already present
+ */
+function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } = {}) {
+  const state = { spawned: [], copies: [], removed: [], killed: 0, cdpUp: false };
+  const deps = {
+    existsSync: (p) => {
+      if (p === MSIX_EXE) return true;
+      if (p.includes('tradingview-mcp')) return copyExists || state.copies.length > 0;
+      return false;
+    },
+    execSync: (cmd) => {
+      if (cmd.includes('Get-AppxPackage')) {
+        return 'C:\\Program Files\\WindowsApps\\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\n';
+      }
+      if (cmd.includes('taskkill')) { state.killed++; return ''; }
+      throw new Error(`unexpected execSync: ${cmd}`);
+    },
+    spawn: (exe) => {
+      state.spawned.push(exe);
+      const fail = spawnFailures.some((s) => exe.includes(s));
+      if (!fail && cdpBindsFor.some((s) => exe.includes(s))) state.cdpUp = true;
+      return mockChild(fail ? { failWith: 'EACCES' } : {});
+    },
+    cpSync: (src, dst) => { state.copies.push({ src, dst }); },
+    rmSync: (p) => { state.removed.push(p); },
+    readdirSync: () => ['TradingView.Desktop_3.0.0.7652_x64__n534cwy3pjxzj'],
+    delay: async () => {},
+    probeCdp: async () => (state.cdpUp ? CDP_VERSION : null),
+  };
+  return { deps, state };
+}
+
+// launch() only takes the MSIX code path on win32; skip elsewhere.
+const onWindows = process.platform === 'win32';
+
+describe('launch() — MSIX WindowsApps handling', { skip: !onWindows }, () => {
+  it('direct WindowsApps spawn that binds CDP does not copy', async () => {
+    const { deps, state } = msixDeps({ cdpBindsFor: ['WindowsApps'] });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.binary, MSIX_EXE);
+    assert.equal(result.msix_local_copy, undefined);
+    assert.equal(state.copies.length, 0);
+    assert.equal(result.cdp_url, 'http://127.0.0.1:9222');
   });
 
-  it('finds the Program Files install', () => {
-    const exe = `${WIN_ENV.PROGRAMFILES}\\TradingView\\TradingView.exe`;
-    const { _deps } = mockDeps({ existing: [exe] });
-    const { tvPath } = findTradingViewPath({ platform: 'win32', env: WIN_ENV, _deps });
-    assert.equal(tvPath, exe);
+  it('EACCES on direct spawn falls back to local copy', async () => {
+    const { deps, state } = msixDeps({ spawnFailures: ['WindowsApps'], cdpBindsFor: ['tradingview-mcp'] });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.msix_local_copy, true);
+    assert.equal(result.binary, LOCAL_COPY_EXE);
+    assert.equal(state.copies.length, 1);
+    assert.match(state.copies[0].src, /WindowsApps/);
+    // stale cached version of another release is cleaned up first
+    assert.equal(state.removed.length, 1);
+    assert.match(state.removed[0], /3\.0\.0\.7652/);
+    // the CDP-less direct instance is killed before relaunching from the copy
+    assert.ok(state.killed >= 2);
+  });
+
+  it('CDP never binding on direct spawn falls back to local copy', async () => {
+    const { deps, state } = msixDeps({ cdpBindsFor: ['tradingview-mcp'] });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.msix_local_copy, true);
+    assert.equal(state.spawned.length, 2);
+    assert.match(state.spawned[0], /WindowsApps/);
+    assert.match(state.spawned[1], /tradingview-mcp/);
+  });
+
+  it('reuses an existing local copy without re-copying', async () => {
+    const { deps, state } = msixDeps({ spawnFailures: ['WindowsApps'], cdpBindsFor: ['tradingview-mcp'], copyExists: true });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.msix_local_copy, true);
+    assert.equal(state.copies.length, 0);
+  });
+
+  it('returns cdp_ready:false warning when nothing binds', async () => {
+    const { deps } = msixDeps({});
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.cdp_ready, false);
+    assert.equal(result.msix_local_copy, true);
+    assert.ok(result.warning);
   });
 });
 
-describe('findTradingViewPath — win32 MSIX (Microsoft Store)', () => {
-  it('resolves via Get-AppxPackage InstallLocation', () => {
-    const { _deps, execCalls } = mockDeps({
-      existing: [MSIX_EXE],
-      execResults: { 'Get-AppxPackage': `C:\\Program Files\\WindowsApps\\${MSIX_PKG}\r\n` },
-    });
-    const { tvPath } = findTradingViewPath({ platform: 'win32', env: WIN_ENV, _deps });
-    assert.equal(tvPath, MSIX_EXE);
-    assert.ok(execCalls.some(c => c.includes('Get-AppxPackage -Name TradingView.Desktop')));
+describe('launch() — classic install path', { skip: !onWindows }, () => {
+  it('launches classic LOCALAPPDATA install without MSIX logic', async () => {
+    const classicExe = `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`;
+    const state = { spawned: [], cdpUp: false };
+    const deps = {
+      existsSync: (p) => p === classicExe,
+      execSync: (cmd) => { if (cmd.includes('taskkill')) return ''; throw new Error(`unexpected: ${cmd}`); },
+      spawn: (exe) => { state.spawned.push(exe); state.cdpUp = true; return mockChild(); },
+      cpSync: () => { throw new Error('should not copy'); },
+      rmSync: () => {},
+      readdirSync: () => [],
+      delay: async () => {},
+      probeCdp: async () => (state.cdpUp ? CDP_VERSION : null),
+    };
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.binary, classicExe);
+    assert.equal(result.msix_local_copy, undefined);
+    assert.deepEqual(state.spawned, [classicExe]);
   });
 
-  it('falls back to a WindowsApps directory glob when PowerShell fails', () => {
-    const { _deps } = mockDeps({
-      existing: [MSIX_EXE],
-      execResults: { 'Get-AppxPackage': new Error('powershell not found') },
-      dirEntries: ['Microsoft.WindowsCalculator_11.0_x64__8wekyb3d8bbwe', MSIX_PKG],
-    });
-    const { tvPath } = findTradingViewPath({ platform: 'win32', env: WIN_ENV, _deps });
-    assert.equal(tvPath, MSIX_EXE);
-  });
-
-  it('picks the highest version when multiple MSIX packages exist', () => {
-    const oldPkg = 'TradingView.Desktop_3.1.9.8000_x64__n534cwy3pjxzj';
-    const newExe = MSIX_EXE;
-    const oldExe = `C:\\Program Files\\WindowsApps\\${oldPkg}\\TradingView.exe`;
-    const { _deps } = mockDeps({
-      existing: [oldExe, newExe],
-      execResults: { 'Get-AppxPackage': new Error('no powershell') },
-      dirEntries: [oldPkg, MSIX_PKG],
-    });
-    const { tvPath } = findTradingViewPath({ platform: 'win32', env: WIN_ENV, _deps });
-    assert.equal(tvPath, newExe, '3.2.0.7916 beats 3.1.9.8000 despite lexical order');
-  });
-
-  it('ignores non-x64 and unrelated package directories', () => {
-    const { _deps } = mockDeps({
-      existing: [],
-      execResults: { 'Get-AppxPackage': '' },
-      dirEntries: ['TradingView.Desktop_3.2.0.7916_arm64__n534cwy3pjxzj', 'NotTradingView_1.0_x64__abc'],
-    });
-    const { tvPath } = findTradingViewPath({ platform: 'win32', env: WIN_ENV, _deps });
-    assert.equal(tvPath, null);
-  });
-
-  it('survives an ACL-restricted WindowsApps directory', () => {
-    const { _deps } = mockDeps({
-      existing: [],
-      execResults: { 'Get-AppxPackage': '' },
-      dirEntries: null, // readdirSync throws EPERM
-    });
-    const { tvPath, candidates } = findTradingViewPath({ platform: 'win32', env: WIN_ENV, _deps });
-    assert.equal(tvPath, null);
-    assert.ok(candidates.some(c => c.includes('WindowsApps')), 'error message mentions the MSIX path');
-  });
-});
-
-describe('findTradingViewPath — other platforms', () => {
-  it('finds the macOS app bundle', () => {
-    const exe = '/Applications/TradingView.app/Contents/MacOS/TradingView';
-    const { _deps } = mockDeps({ existing: [exe] });
-    const { tvPath } = findTradingViewPath({ platform: 'darwin', env: { HOME: '/Users/test' }, _deps });
-    assert.equal(tvPath, exe);
-  });
-
-  it('does not attempt MSIX detection on linux', () => {
-    const { _deps, execCalls } = mockDeps({
-      existing: ['/opt/TradingView/tradingview'],
-    });
-    const { tvPath } = findTradingViewPath({ platform: 'linux', env: { HOME: '/home/test' }, _deps });
-    assert.equal(tvPath, '/opt/TradingView/tradingview');
-    assert.ok(!execCalls.some(c => c.includes('Get-AppxPackage')));
+  it('throws a helpful error when TradingView is not found', async () => {
+    const deps = {
+      existsSync: () => false,
+      execSync: () => { throw new Error('not found'); },
+      spawn: () => { throw new Error('should not spawn'); },
+      cpSync: () => {}, rmSync: () => {}, readdirSync: () => [],
+      delay: async () => {}, probeCdp: async () => null,
+    };
+    await assert.rejects(() => launch({ _deps: deps }), /TradingView not found/);
   });
 });

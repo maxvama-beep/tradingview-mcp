@@ -32,10 +32,13 @@ export async function click({ by, value }) {
  * Report whether a bottom panel is open, and which mechanism this build uses.
  *
  * TradingView Desktop 3.3 moved the Pine editor out of the bottom widget bar
- * and into a side dialog. `bottomWidgetBar` still exists on 3.3, but it
- * registers no widgets — enabledWidgets() is empty — so showWidget(),
- * activateScriptEditorTab() and hideWidget() all return without doing
- * anything. Detect the dialog and drive it directly instead.
+ * and into a side dialog. `bottomWidgetBar` still exists on 3.3, and after
+ * waitForWidgetsInitialized() it registers exactly one widget (backtesting) —
+ * the editor is not among them. showWidget()/activateScriptEditorTab() are
+ * therefore silent no-ops for the editor on that build, so detect the dialog
+ * and drive it directly.
+ *
+ * Verified against TradingView.Desktop 3.3.0.7992.
  */
 async function readPanelState(panel) {
   return evaluate(`
@@ -93,8 +96,11 @@ async function performPanelAction(panel, mode, open) {
         else return { acted: false, reason: 'bottomWidgetBar exposes no show method' };
         return { acted: true };
       }
+      // hideWidget(name) was removed in newer TradingView builds; fall back to
+      // close() (minimizes the bottom panel) and then hide() (hides the bar).
       if (typeof bwb.hideWidget === 'function') { bwb.hideWidget(widgetName); return { acted: true }; }
       if (typeof bwb.close === 'function') { bwb.close(); return { acted: true }; }
+      if (typeof bwb.hide === 'function') { bwb.hide(); return { acted: true }; }
       return { acted: false, reason: 'bottomWidgetBar exposes no hide method' };
     })()
   `);
@@ -115,9 +121,8 @@ export async function openPanel({ panel, action }) {
 
     const outcome = await performPanelAction(panel, mode, wantOpen);
 
-    // Confirm the panel actually moved. The previous implementation reported
-    // 'opened'/'closed' without checking, so on builds where the underlying
-    // call is a no-op it claimed success while nothing happened.
+    // Confirm the panel actually moved. Reporting 'opened'/'closed' merely
+    // because some code ran meant a silent no-op still looked like success.
     let isOpen = wasOpen;
     for (let i = 0; i < 15; i++) {
       await new Promise(r => setTimeout(r, 200));
@@ -136,18 +141,23 @@ export async function openPanel({ panel, action }) {
 
     return { success: true, panel, action, mode, was_open: wasOpen, performed: wantOpen ? 'opened' : 'closed', verified: true };
   } else {
+    // Newer TV builds renamed the right-rail buttons (watchlist is now
+    // data-name="base", aria "Watchlist, details, and news"; alerts is
+    // data-name="alerts") — keep legacy selectors as fallbacks.
     const selectorMap = {
-      'watchlist': { dataName: 'base-watchlist-widget-button', ariaLabel: 'Watchlist' },
-      'alerts': { dataName: 'alerts-button', ariaLabel: 'Alerts' },
-      'trading': { dataName: 'trading-button', ariaLabel: 'Trading Panel' },
+      'watchlist': { dataNames: ['base-watchlist-widget-button', 'base'], ariaLabels: ['Watchlist', 'Watchlist, details, and news'] },
+      'alerts': { dataNames: ['alerts-button', 'alerts'], ariaLabels: ['Alerts'] },
+      'trading': { dataNames: ['trading-button'], ariaLabels: ['Trading Panel'] },
     };
     const sel = selectorMap[panel];
     const result = await evaluate(`
       (function() {
-        var dataName = ${JSON.stringify(sel.dataName)};
-        var ariaLabel = ${JSON.stringify(sel.ariaLabel)};
+        var dataNames = ${JSON.stringify(sel.dataNames)};
+        var ariaLabels = ${JSON.stringify(sel.ariaLabels)};
         var action = ${JSON.stringify(action)};
-        var btn = document.querySelector('[data-name="' + dataName + '"]') || document.querySelector('[aria-label="' + ariaLabel + '"]');
+        var btn = null;
+        for (var d = 0; d < dataNames.length && !btn; d++) btn = document.querySelector('[data-name="' + dataNames[d] + '"]');
+        for (var a = 0; a < ariaLabels.length && !btn; a++) btn = document.querySelector('[aria-label="' + ariaLabels[a] + '"]');
         if (!btn) return { error: 'Button not found for panel: ' + ${JSON.stringify(panel)} };
         var isActive = btn.getAttribute('aria-pressed') === 'true' || btn.classList.contains('isActive') || btn.classList.toString().indexOf('active') !== -1 || btn.classList.toString().indexOf('Active') !== -1;
         var rightArea = document.querySelector('[class*="layout__area--right"]');
