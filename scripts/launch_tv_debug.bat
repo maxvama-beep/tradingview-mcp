@@ -6,9 +6,7 @@ set PORT=%1
 if "%PORT%"=="" set PORT=9222
 
 REM Kill existing TradingView instances
-REM Sleeps use ping, not timeout: "timeout" aborts with "Input redirection is
-REM not supported" whenever stdin is redirected, which is how this script runs
-REM when spawned by tv_launch rather than typed into a console.
+REM (ping -n is used for waits throughout: timeout /t aborts when stdin is redirected)
 taskkill /F /IM TradingView.exe >nul 2>&1
 ping -n 3 127.0.0.1 >nul
 
@@ -20,7 +18,14 @@ if exist "%LOCALAPPDATA%\TradingView\TradingView.exe" set "TV_EXE=%LOCALAPPDATA%
 if exist "%PROGRAMFILES%\TradingView\TradingView.exe" set "TV_EXE=%PROGRAMFILES%\TradingView\TradingView.exe"
 if exist "%PROGRAMFILES(x86)%\TradingView\TradingView.exe" set "TV_EXE=%PROGRAMFILES(x86)%\TradingView\TradingView.exe"
 
-REM Check MSIX / Windows Store installs
+REM Check MSIX / Windows Store installs.
+REM Get-AppxPackage resolves the install without elevation; enumerating
+REM %PROGRAMFILES%\WindowsApps with dir requires admin rights, so keep it as a fallback.
+if "%TV_EXE%"=="" (
+    for /f "usebackq tokens=*" %%i in (`powershell -NoProfile -Command "(Get-AppxPackage -Name 'TradingView.Desktop' -ErrorAction SilentlyContinue).InstallLocation" 2^>nul`) do (
+        if exist "%%i\TradingView.exe" set "TV_EXE=%%i\TradingView.exe"
+    )
+)
 if "%TV_EXE%"=="" (
     for /f "tokens=*" %%i in ('dir /s /b "%PROGRAMFILES%\WindowsApps\TradingView*\TradingView.exe" 2^>nul') do set "TV_EXE=%%i"
 )
@@ -44,38 +49,26 @@ start "" "%TV_EXE%" --remote-debugging-port=%PORT%
 echo Waiting for CDP to become available...
 ping -n 6 127.0.0.1 >nul
 
-REM Poll for at most MAX_TRIES attempts, 2 seconds apart, then give up
-set /a TRIES=0
-set /a MAX_TRIES=30
-
+REM Use 127.0.0.1 rather than localhost: on some machines localhost resolves to
+REM IPv6 ::1, which Electron's debug server does not listen on.
+set TRIES=0
 :check
-curl -s http://localhost:%PORT%/json/version >nul 2>&1
+curl -s http://127.0.0.1:%PORT%/json/version >nul 2>&1
 if %errorlevel% equ 0 goto ready
 set /a TRIES+=1
-if %TRIES% geq %MAX_TRIES% goto giveup
-echo Still waiting... (%TRIES%/%MAX_TRIES%)
+if %TRIES% geq 30 (
+    echo.
+    echo Error: TradingView is running but CDP never became available on port %PORT%.
+    echo Some Windows MSIX builds block the debug port. Use the tv_launch MCP tool,
+    echo which falls back to launching from a local copy of the package.
+    exit /b 1
+)
+echo Still waiting...
 ping -n 3 127.0.0.1 >nul
 goto check
 
-:giveup
-echo.
-echo Error: CDP never came up on port %PORT% after %MAX_TRIES% attempts.
-echo.
-echo Things to check:
-echo   - Is TradingView actually running? It may have failed to start.
-echo   - Is another process already using port %PORT%? Try a different port:
-echo       scripts\launch_tv_debug.bat 9333
-echo   - Microsoft Store (MSIX) installs accept --remote-debugging-port fine,
-echo     but the WindowsApps probe above cannot see them: that directory is
-echo     ACL-restricted, so "dir /s /b" returns nothing. Get the real path with
-echo       powershell -c "(Get-AppxPackage *TradingView*).InstallLocation"
-echo     and launch that exe directly.
-echo   - Launched exe was: %TV_EXE%
-exit /b 1
-
 :ready
 echo.
-echo CDP ready at http://localhost:%PORT%
-curl -s http://localhost:%PORT%/json/version
+echo CDP ready at http://127.0.0.1:%PORT%
+curl -s http://127.0.0.1:%PORT%/json/version
 echo.
-exit /b 0
