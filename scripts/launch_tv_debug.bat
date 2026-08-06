@@ -65,8 +65,11 @@ echo Things to check:
 echo   - Is TradingView actually running? It may have failed to start.
 echo   - Is another process already using port %PORT%? Try a different port:
 echo       scripts\launch_tv_debug.bat 9333
-echo   - Was TradingView launched from an MSIX / Microsoft Store install?
-echo     Those drop command-line arguments, so --remote-debugging-port is ignored.
+echo   - Microsoft Store (MSIX) installs accept --remote-debugging-port fine,
+echo     but the WindowsApps probe above cannot see them: that directory is
+echo     ACL-restricted, so "dir /s /b" returns nothing. Get the real path with
+echo       powershell -c "(Get-AppxPackage *TradingView*).InstallLocation"
+echo     and launch that exe directly.
 echo   - Launched exe was: %TV_EXE%
 exit /b 1
 
